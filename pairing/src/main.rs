@@ -1,4 +1,4 @@
-use bls12_381::{G1Affine, G2Affine, pairing, Scalar};
+use bls12_381::{pairing, G1Affine, G2Affine, Scalar};
 
 /// To demonstrate the basic property of EC pairing which is:
 ///
