@@ -39,7 +39,7 @@ fn main() {
     println!("Public key(2)={:#?}", public_key);
     assert_eq!(t, public_key);
 
-    // Now we want to encrypt a message. From BLS we remember that:
+    // Now we want to sign a message. From BLS we remember that:
     // Private key = a
     // Public key  = a * G
     // Signature   = a * M
@@ -47,7 +47,7 @@ fn main() {
     // And we would use the following identity to verify the signature.
     // e(Public key, M) = e(aG, M) = e(G, aM) = e(G, Signature)
     //
-    // Now we want to use f(0) as our private key, so:
+    // Let's use f(0) as our private key, so:
     // Private key = f(0)
     // Public key  = f(0) * G
     // Signature   = f(0) * M
