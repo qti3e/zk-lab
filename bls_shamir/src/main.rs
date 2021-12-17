@@ -2,8 +2,8 @@ use bls12_381::hash_to_curve::*;
 use bls12_381::*;
 use group::Curve;
 
-/// The goal is to verify that we can produce a proof for the value of F(X), without
-/// knowing the components of F(X).
+/// A threshold sign using a secret polynomial f(x), using f(0) as the private
+/// key.
 #[allow(non_snake_case)]
 fn main() {
     let G = G1Affine::generator();
