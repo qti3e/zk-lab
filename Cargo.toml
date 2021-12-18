@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "bls_shamir",
+  "dkg",
   "pairing"
 ]
 

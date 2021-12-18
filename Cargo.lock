@@ -77,6 +77,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dkg"
+version = "0.1.0"
+dependencies = [
+ "bls12_381",
+ "group",
+ "sha2",
+]
+
+[[package]]
 name = "ff"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
