@@ -1,16 +1,15 @@
-use async_std::{io, task};
-use futures::{
-    prelude::{stream::StreamExt, *},
-    select,
+use async_std::io;
+use futures::{prelude::*, select};
+use libp2p::gossipsub::MessageId;
+use libp2p::gossipsub::{
+    GossipsubEvent, GossipsubMessage, IdentTopic as Topic, MessageAuthenticity, ValidationMode,
 };
-use libp2p::{
-    floodsub::{self, Floodsub, FloodsubEvent},
-    identity,
-    mdns::{Mdns, MdnsConfig, MdnsEvent},
-    swarm::SwarmEvent,
-    Multiaddr, NetworkBehaviour, PeerId, Swarm,
-};
+use libp2p::{gossipsub, identity, swarm::SwarmEvent, Multiaddr, PeerId};
+use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
+
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -18,58 +17,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_peer_id = PeerId::from(local_key.public());
 
     println!("Local peer id: {:?}", local_peer_id);
-    let transport = libp2p::development_transport(local_key).await?;
+    let transport = libp2p::development_transport(local_key.clone()).await?;
 
-    // Create a floodsub topic
-    let floodsub_topic = floodsub::Topic::new("chat");
+    // Create a Gossipsub topic
+    let topic = Topic::new("test-net");
 
-    // We create a custom network behaviour, it combines floodsub and mDNS.
-    #[derive(NetworkBehaviour)]
-    #[behaviour(out_event = "OutEvent")]
-    struct ChatBehaviour {
-        floodsub: Floodsub,
-        mdns: Mdns,
-
-        // Struct fields which do not implement NetworkBehaviour need to be ignore
-        #[behaviour(ignore)]
-        #[allow(dead_code)]
-        ignored_member: bool,
-    }
-
-    #[derive(Debug)]
-    enum OutEvent {
-        Floodsub(FloodsubEvent),
-        Mdns(MdnsEvent),
-    }
-
-    impl From<MdnsEvent> for OutEvent {
-        fn from(v: MdnsEvent) -> Self {
-            Self::Mdns(v)
-        }
-    }
-
-    impl From<FloodsubEvent> for OutEvent {
-        fn from(v: FloodsubEvent) -> Self {
-            Self::Floodsub(v)
-        }
-    }
-
+    // Create a Swarm to manage peers and events
     let mut swarm = {
-        let mdns = Mdns::new(MdnsConfig::default()).await?;
-        let mut behaviour = ChatBehaviour {
-            floodsub: Floodsub::new(local_peer_id),
-            mdns,
-            ignored_member: false,
+        // To content-address message, we can take the hash of message and use it as an ID.
+        let message_id_fn = |message: &GossipsubMessage| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            MessageId::from(s.finish().to_string())
         };
 
-        behaviour.floodsub.subscribe(floodsub_topic.clone());
-        Swarm::new(transport, behaviour, local_peer_id)
+        // Set a custom gossipsub
+        let gossipsub_config = gossipsub::GossipsubConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
+            .validation_mode(ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message signing)
+            .message_id_fn(message_id_fn) // content-address messages. No two messages of the
+            // same content will be propagated.
+            .build()
+            .expect("Valid config");
+        // build a gossipsub network behaviour
+        let mut gossipsub: gossipsub::Gossipsub =
+            gossipsub::Gossipsub::new(MessageAuthenticity::Signed(local_key), gossipsub_config)
+                .expect("Correct configuration");
+
+        // subscribes to our topic
+        gossipsub.subscribe(&topic).unwrap();
+
+        // add an explicit peer if one was provided
+        if let Some(explicit) = std::env::args().nth(2) {
+            let explicit = explicit.clone();
+            match explicit.parse() {
+                Ok(id) => gossipsub.add_explicit_peer(&id),
+                Err(err) => println!("Failed to parse explicit peer id: {:?}", err),
+            }
+        }
+
+        // build the swarm
+        libp2p::Swarm::new(transport, gossipsub, local_peer_id)
     };
 
     if let Some(to_dial) = std::env::args().nth(1) {
-        let addr: Multiaddr = to_dial.parse()?;
-        swarm.dial(addr)?;
-        println!("Dialed {:?}", to_dial)
+        let address: Multiaddr = to_dial.parse().expect("User to provide valid address.");
+        match swarm.dial(address.clone()) {
+            Ok(_) => println!("Dialed {:?}", address),
+            Err(e) => println!("Dial {:?} failed: {:?}", address, e),
+        };
     }
 
     let mut stdin = io::BufReader::new(io::stdin()).lines().fuse();
@@ -78,10 +74,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         select! {
-            line = stdin.select_next_some() => swarm
-                .behaviour_mut()
-                .floodsub
-                .publish(floodsub_topic.clone(), line.expect("Stdin not to close").as_bytes()),
+            line = stdin.select_next_some() => {
+                if let Err(e) = swarm
+                    .behaviour_mut()
+                    .publish(topic.clone(), line.expect("Stdin not to close").as_bytes())
+                {
+                    println!("Publish error: {:?}", e);
+                }
+            },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     println!("Listening on {:?}", address)
@@ -98,36 +98,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 SwarmEvent::Dialing(peer_id) => {
                     println!("Dialing {:?}", peer_id);
                 }
-
-                SwarmEvent::Behaviour(OutEvent::Floodsub(FloodsubEvent::Message(message))) => {
-                    println!(
-                        "Received: '{:?}' from {:?}",
-                        String::from_utf8_lossy(&message.data),
-                        message.source
-                    );
-                }
-                SwarmEvent::Behaviour(OutEvent::Mdns(MdnsEvent::Discovered(list))) => {
-                    for (peer, addr) in list {
-                        println!("discovered {} {}", peer, addr);
-                        swarm
-                            .behaviour_mut()
-                            .floodsub
-                            .add_node_to_partial_view(peer);
-                    }
-                }
-                SwarmEvent::Behaviour(OutEvent::Mdns(MdnsEvent::Expired(list))) => {
-                    for (peer, addr) in list {
-                        println!("expired {} {}", peer, addr);
-                        if !swarm.behaviour_mut().mdns.has_node(&peer) {
-                            swarm
-                                .behaviour_mut()
-                                .floodsub
-                                .remove_node_from_partial_view(&peer);
-                        }
-                    }
-                }
+                SwarmEvent::Behaviour(GossipsubEvent::Message {
+                    propagation_source: peer_id,
+                    message_id: id,
+                    message,
+                }) => println!(
+                    "Got message: {} with id: {} from peer: {:?}",
+                    String::from_utf8_lossy(&message.data),
+                    id,
+                    peer_id
+                ),
                 _ => {}
-                }
+            }
         }
     }
 }
