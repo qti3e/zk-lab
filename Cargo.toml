@@ -2,7 +2,8 @@
 members = [
   "bls_shamir",
   "dkg",
-  "pairing"
+  "pairing",
+  "p2p",
 ]
 
 [profile.release]
