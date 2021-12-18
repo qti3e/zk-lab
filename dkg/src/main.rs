@@ -127,12 +127,41 @@ fn main() {
 
     // Each of the participants (we said we're gonna use only 3) sends the value of
     // `(x, yM)`.
-    let sign_shares = shares[0..3]
+    let mut sign_shares = shares[0..3]
         .iter()
         .map(|(x, y)| (*x, M * Scalar::from(*y)))
         .collect::<Vec<_>>();
 
+    // Node 4 returns an invalid signature share. This can mess with the final
+    // signature and invalidate it. So we will detect it by the following
+    // verifications:
+    // 1. (x, yG) is a valid point on H(x) * G
+    // 2. e(yG, M) == e(G, yM)
+
+    sign_shares.push((4, M * Scalar::from(29)));
+
+    let nodes = sign_shares.len();
     println!("Using {} nodes to sign the message", sign_shares.len());
+
+    // Disqualify invalid shares.
+    let sign_shares = sign_shares
+        .into_iter()
+        .filter(|(x, yM)| {
+            let node = (x - 1) as usize;
+            let yG = (f_public_points[node].1 + g_public_points[node].1).to_affine();
+
+            let l = pairing(&yG, &M);
+            let r = pairing(&G, &yM.to_affine());
+
+            l == r
+        })
+        .collect::<Vec<_>>();
+
+    println!(
+        "Validated {} shares ({} node(s) sent invalid share.)",
+        sign_shares.len(),
+        nodes - sign_shares.len()
+    );
 
     // We now have 3 points `(x, yM)` which means we can compute `h(0) * M` which
     // is the signature.
@@ -149,9 +178,6 @@ fn main() {
     assert_eq!(left, right);
 
     println!("Signature validated.")
-
-    // Future work: Verify that the shares (x, yM) are valid in case a non-honest
-    // node tries to send invalid signature shares.
 }
 
 /// Given a vector of coefficients `[a_i]` computes `f(x) = ∑ a_i * x^i`
