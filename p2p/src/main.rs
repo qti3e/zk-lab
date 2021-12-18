@@ -1,9 +1,16 @@
+use async_std::{io, task};
+use futures::{
+    prelude::{stream::StreamExt, *},
+    select,
+};
+use libp2p::{
+    floodsub::{self, Floodsub, FloodsubEvent},
+    identity,
+    mdns::{Mdns, MdnsConfig, MdnsEvent},
+    swarm::SwarmEvent,
+    Multiaddr, NetworkBehaviour, PeerId, Swarm,
+};
 use std::error::Error;
-use libp2p::{identity, Multiaddr, PeerId};
-use futures::executor::block_on;
-use libp2p::swarm::{Swarm, SwarmEvent};
-use futures::{StreamExt};
-use libp2p::mdns::{Mdns, MdnsConfig, MdnsEvent};
 
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -11,51 +18,116 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let local_peer_id = PeerId::from(local_key.public());
 
     println!("Local peer id: {:?}", local_peer_id);
-    let transport = block_on(libp2p::development_transport(local_key))?;
+    let transport = libp2p::development_transport(local_key).await?;
 
-    // A network behaviour cares about "what" data we want to send, while
-    // transport cares about "how" to send the data.
-    let behaviour = Mdns::new(MdnsConfig::default()).await?;
+    // Create a floodsub topic
+    let floodsub_topic = floodsub::Topic::new("chat");
 
-    // Now to connect the two we need to use a swarm. It basically pipes
-    // the behaviour and transport together.
+    // We create a custom network behaviour, it combines floodsub and mDNS.
+    #[derive(NetworkBehaviour)]
+    #[behaviour(out_event = "OutEvent")]
+    struct ChatBehaviour {
+        floodsub: Floodsub,
+        mdns: Mdns,
 
-    let mut swarm = Swarm::new(transport, behaviour, local_peer_id);
+        // Struct fields which do not implement NetworkBehaviour need to be ignore
+        #[behaviour(ignore)]
+        #[allow(dead_code)]
+        ignored_member: bool,
+    }
 
-    // Tell the swarm to listen on all interfaces and a random, OS-assigned port.
-    // It's like TCP bind method.
-    // This string is called a Multiaddr, which is a self describing network
-    // address.
+    #[derive(Debug)]
+    enum OutEvent {
+        Floodsub(FloodsubEvent),
+        Mdns(MdnsEvent),
+    }
+
+    impl From<MdnsEvent> for OutEvent {
+        fn from(v: MdnsEvent) -> Self {
+            Self::Mdns(v)
+        }
+    }
+
+    impl From<FloodsubEvent> for OutEvent {
+        fn from(v: FloodsubEvent) -> Self {
+            Self::Floodsub(v)
+        }
+    }
+
+    let mut swarm = {
+        let mdns = Mdns::new(MdnsConfig::default()).await?;
+        let mut behaviour = ChatBehaviour {
+            floodsub: Floodsub::new(local_peer_id),
+            mdns,
+            ignored_member: false,
+        };
+
+        behaviour.floodsub.subscribe(floodsub_topic.clone());
+        Swarm::new(transport, behaviour, local_peer_id)
+    };
+
+    if let Some(to_dial) = std::env::args().nth(1) {
+        let addr: Multiaddr = to_dial.parse()?;
+        swarm.dial(addr)?;
+        println!("Dialed {:?}", to_dial)
+    }
+
+    let mut stdin = io::BufReader::new(io::stdin()).lines().fuse();
+
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
     loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, ..} => {
-                println!("Listening on {:?}", address)
-            },
-            SwarmEvent::IncomingConnection { send_back_addr,.. } => {
-                println!("Incoming connecting {:?}", send_back_addr)
-            }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                println!("Connection established {:?}", peer_id);
-            }
-            SwarmEvent::ConnectionClosed { peer_id , ..} => {
-                println!("Connection closed {:?}", peer_id);
-            }
-            SwarmEvent::Behaviour(MdnsEvent::Discovered(peers)) => {
-                for (peer, addr) in peers {
-                    println!("discovered {} {}", peer, addr);
+        select! {
+            line = stdin.select_next_some() => swarm
+                .behaviour_mut()
+                .floodsub
+                .publish(floodsub_topic.clone(), line.expect("Stdin not to close").as_bytes()),
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Listening on {:?}", address)
                 }
-            }
-            SwarmEvent::Behaviour(MdnsEvent::Expired(expired)) => {
-                for (peer, addr) in expired {
-                    println!("expired {} {}", peer, addr);
+                SwarmEvent::IncomingConnection { send_back_addr, .. } => {
+                    println!("Incoming connecting {:?}", send_back_addr)
                 }
-            },
-            SwarmEvent::Dialing(peer_id) => {
-                println!("Dialing {:?}", peer_id);
-            }
-            _ => {}
+                SwarmEvent::ConnectionEstablished { peer_id, num_established, .. } => {
+                    println!("Connection established ({}) {:?}", num_established, peer_id);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                    println!("Connection closed {:?}", peer_id);
+                }
+                SwarmEvent::Dialing(peer_id) => {
+                    println!("Dialing {:?}", peer_id);
+                }
+
+                SwarmEvent::Behaviour(OutEvent::Floodsub(FloodsubEvent::Message(message))) => {
+                    println!(
+                        "Received: '{:?}' from {:?}",
+                        String::from_utf8_lossy(&message.data),
+                        message.source
+                    );
+                }
+                SwarmEvent::Behaviour(OutEvent::Mdns(MdnsEvent::Discovered(list))) => {
+                    for (peer, addr) in list {
+                        println!("discovered {} {}", peer, addr);
+                        swarm
+                            .behaviour_mut()
+                            .floodsub
+                            .add_node_to_partial_view(peer);
+                    }
+                }
+                SwarmEvent::Behaviour(OutEvent::Mdns(MdnsEvent::Expired(list))) => {
+                    for (peer, addr) in list {
+                        println!("expired {} {}", peer, addr);
+                        if !swarm.behaviour_mut().mdns.has_node(&peer) {
+                            swarm
+                                .behaviour_mut()
+                                .floodsub
+                                .remove_node_from_partial_view(&peer);
+                        }
+                    }
+                }
+                _ => {}
+                }
         }
     }
 }
